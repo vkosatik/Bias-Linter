@@ -1,0 +1,8 @@
+node_modules/
+*.tsbuildinfo
+.vscode-test/
+*.vsix
+*.log
+npm-debug.log*
+.DS_Store
+out/
