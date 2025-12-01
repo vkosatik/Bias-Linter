@@ -1,0 +1,82 @@
+[
+	{
+		"id": "terminology.whitelist",
+		"term": "whitelist",
+		"variants": ["white list"],
+		"suggestions": ["allowlist"],
+		"reason": "Allowlist is a neutral alternative that avoids color-based metaphors and clarifies access control.",
+		"severity": "warning"
+	},
+	{
+		"id": "terminology.blacklist",
+		"term": "blacklist",
+		"variants": ["black list"],
+		"suggestions": ["blocklist"],
+		"reason": "Blocklist avoids equating the color black with exclusion and mirrors current security terminology.",
+		"severity": "warning"
+	},
+	{
+		"id": "terminology.master",
+		"term": "master",
+		"suggestions": ["primary", "main"],
+		"reason": "Master/slave metaphors reference enslavement; opt for precise role names such as primary/main and secondary/replica.",
+		"severity": "warning"
+	},
+	{
+		"id": "terminology.slave",
+		"term": "slave",
+		"suggestions": ["secondary", "replica"],
+		"reason": "Slave terminology inherits oppressive metaphors; choose neutral descriptors like secondary or replica.",
+		"severity": "warning"
+	},
+	{
+		"id": "terminology.sanity_check",
+		"term": "sanity check",
+		"suggestions": ["confidence check", "quick check"],
+		"reason": "Sanity check implies ableism; confidence or quick check communicates the same intent without stigmatizing language.",
+		"severity": "information"
+	},
+	{
+		"id": "terminology.grandfathered",
+		"term": "grandfathered",
+		"suggestions": ["legacy exemption", "existing exemption"],
+		"reason": "Grandfathered stems from discriminatory policies; use neutral phrases like legacy or existing exemption to describe conditional access.",
+		"severity": "information"
+	},
+	{
+		"id": "terminology.guys",
+		"term": "guys",
+		"suggestions": ["folks", "everyone"],
+		"reason": "Guys assumes a masculine audience; folks or everyone are inclusive when addressing mixed groups.",
+		"severity": "information"
+	},
+	{
+		"id": "terminology.dummy",
+		"term": "dummy",
+		"suggestions": ["sample", "placeholder"],
+		"reason": "Dummy can imply unintelligence; sample or placeholder describe test data without disparaging language.",
+		"severity": "information"
+	},
+	{
+		"id": "terminology.crazy",
+		"term": "crazy",
+		"suggestions": ["unexpected", "erratic"],
+		"reason": "Crazy carries ableist connotations; unexpected or erratic focus on the behavior instead of mental health.",
+		"severity": "information"
+	},
+	{
+		"id": "terminology.manpower",
+		"term": "manpower",
+		"variants": ["man power", "man-hours", "man hours"],
+		"suggestions": ["people power", "workforce", "staff hours"],
+		"reason": "Manpower and man-hours assume male labor; workforce or staff hours keep the phrasing gender-neutral.",
+		"severity": "information"
+	},
+	{
+		"id": "terminology.tribal_knowledge",
+		"term": "tribal knowledge",
+		"suggestions": ["team-specific knowledge", "institutional knowledge"],
+		"reason": "Tribal knowledge can appropriate Indigenous cultures; institutional or team-specific knowledge conveys the concept respectfully.",
+		"severity": "information"
+	}
+]
