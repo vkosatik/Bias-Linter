@@ -28,6 +28,28 @@ interface NormalizedTerm {
 	variant: string;
 }
 
+interface ProtectedAttributeRule {
+	id: string;
+	attribute: string;
+	synonyms: string[];
+	reason: string;
+	suggestions?: string[];
+	severity?: BiasSeverity;
+	supportsRangeComparisons?: boolean;
+}
+
+interface StructuralMatch {
+	rule: ProtectedAttributeRule;
+	attributeText: string;
+	literalText?: string;
+	comparisonType: 'equality' | 'range' | 'case';
+	operatorText?: string;
+	node: ts.Node;
+}
+
+type AttributeBinding = { rule: ProtectedAttributeRule; text: string };
+type AttributeAliasMap = Map<string, AttributeBinding>;
+
 const AST_LANGUAGES = new Set<string>([
 	'javascript',
 	'javascriptreact',
@@ -54,6 +76,66 @@ const normalizedTerms: NormalizedTerm[] = biasTerms.flatMap((entry) => {
 		variant: variant.toLowerCase(),
 	}));
 });
+
+const PROTECTED_ATTRIBUTE_RULES: ProtectedAttributeRule[] = [
+	{
+		id: 'logic.gender_branch',
+		attribute: 'gender',
+		synonyms: ['gender', 'sex'],
+		reason:
+			'Hardcoding binary gender checks can exclude non-binary identities and propagate allocative harm.',
+		suggestions: ['Gate access on capability-based signals instead of gender'],
+		severity: 'warning',
+	},
+	{
+		id: 'logic.race_branch',
+		attribute: 'race',
+		synonyms: ['race', 'ethnicity'],
+		reason: 'Race or ethnicity specific branches can reinforce discriminatory treatment.',
+		suggestions: ['Use location or qualification based inputs rather than racial categories'],
+		severity: 'warning',
+	},
+	{
+		id: 'logic.religion_branch',
+		attribute: 'religion',
+		synonyms: ['religion', 'faith'],
+		reason: 'Religion-specific control flow may violate inclusion policies.',
+		suggestions: ['Favor behavior or consent signals over religious identity'],
+		severity: 'warning',
+	},
+	{
+		id: 'logic.orientation_branch',
+		attribute: 'sexual orientation',
+		synonyms: ['orientation', 'sexualorientation', 'sexual_orientation'],
+		reason: 'Encoding outcomes by sexual orientation can entrench bias and privacy leaks.',
+		suggestions: ['Avoid branching on sexual orientation; prefer voluntary preference settings'],
+		severity: 'warning',
+	},
+	{
+		id: 'logic.age_branch',
+		attribute: 'age',
+		synonyms: ['age'],
+		reason: 'Age based gates require legal review to avoid disparate impact.',
+		suggestions: ['Lean on regulatory compliance services or dynamic eligibility checks'],
+		severity: 'information',
+		supportsRangeComparisons: true,
+	},
+	{
+		id: 'logic.disability_branch',
+		attribute: 'disability status',
+		synonyms: ['disability', 'abilitystatus', 'ability_status'],
+		reason: 'Routing by disability can violate accessibility norms.',
+		suggestions: ['Offer self-service accommodations instead of branching logic'],
+		severity: 'warning',
+	},
+];
+
+const protectedAttributeLookup = new Map<string, ProtectedAttributeRule>();
+for (const rule of PROTECTED_ATTRIBUTE_RULES) {
+	for (const synonym of rule.synonyms) {
+		protectedAttributeLookup.set(normalizeAttributeKey(synonym), rule);
+	}
+}
 
 let diagnosticCollection: vscode.DiagnosticCollection | undefined;
 
@@ -115,6 +197,7 @@ function lintDocument(document: vscode.TextDocument, collection: vscode.Diagnost
 function lintWithAst(document: vscode.TextDocument, sourceText: string): vscode.Diagnostic[] {
 	const sourceFile = ts.createSourceFile(document.fileName, sourceText, ts.ScriptTarget.Latest, true);
 	const diagnostics: vscode.Diagnostic[] = [];
+	const attributeAliases = collectAttributeAliases(sourceFile);
 
 	const visit = (node: ts.Node) => {
 		if (ts.isIdentifier(node)) {
@@ -123,6 +206,10 @@ function lintWithAst(document: vscode.TextDocument, sourceText: string): vscode.
 
 		if (ts.isStringLiteralLike(node)) {
 			collectStringDiagnostics(node, document, sourceFile, diagnostics);
+		}
+
+		if (ts.isIfStatement(node) || ts.isConditionalExpression(node) || ts.isSwitchStatement(node)) {
+			collectStructuralLogicDiagnostics(node, document, sourceFile, diagnostics, attributeAliases);
 		}
 
 		ts.forEachChild(node, visit);
@@ -208,6 +295,145 @@ function collectStringDiagnostics(
 	}
 }
 
+function collectStructuralLogicDiagnostics(
+	node: ts.IfStatement | ts.ConditionalExpression | ts.SwitchStatement,
+	document: vscode.TextDocument,
+	sourceFile: ts.SourceFile,
+	diagnostics: vscode.Diagnostic[],
+	attributeAliases: AttributeAliasMap,
+): void {
+	if (ts.isIfStatement(node)) {
+		const matches = findProtectedAttributeComparisons(node.expression, sourceFile, attributeAliases);
+		for (const match of matches) {
+			const range = new vscode.Range(
+				document.positionAt(match.node.getStart(sourceFile)),
+				document.positionAt(match.node.getEnd()),
+			);
+			diagnostics.push(createStructuralDiagnostic(range, match));
+		}
+		return;
+	}
+
+	if (ts.isConditionalExpression(node)) {
+		const matches = findProtectedAttributeComparisons(node.condition, sourceFile, attributeAliases);
+		for (const match of matches) {
+			const range = new vscode.Range(
+				document.positionAt(match.node.getStart(sourceFile)),
+				document.positionAt(match.node.getEnd()),
+			);
+			diagnostics.push(createStructuralDiagnostic(range, match));
+		}
+		return;
+	}
+
+	if (ts.isSwitchStatement(node)) {
+		const attribute = getAttributeBinding(node.expression, sourceFile, attributeAliases);
+		if (!attribute) {
+			return;
+		}
+
+		for (const clause of node.caseBlock.clauses) {
+			if (!ts.isCaseClause(clause) || !clause.expression) {
+				continue;
+			}
+
+			const literalText = getLiteralValue(clause.expression) ?? clause.expression.getText(sourceFile);
+			const range = new vscode.Range(
+				document.positionAt(clause.expression.getStart(sourceFile)),
+				document.positionAt(clause.expression.getEnd()),
+			);
+			diagnostics.push(
+				createStructuralDiagnostic(range, {
+					rule: attribute.rule,
+					attributeText: attribute.text,
+					literalText,
+					node: clause.expression,
+					comparisonType: 'case',
+				}),
+			);
+		}
+	}
+}
+
+function findProtectedAttributeComparisons(
+	expression: ts.Expression,
+	sourceFile: ts.SourceFile,
+	attributeAliases: AttributeAliasMap,
+): StructuralMatch[] {
+	const matches: StructuralMatch[] = [];
+
+	const visit = (current: ts.Node) => {
+		if (!ts.isBinaryExpression(current)) {
+			ts.forEachChild(current, visit);
+			return;
+		}
+
+		const operatorKind = current.operatorToken.kind;
+		const operatorText = current.operatorToken.getText(sourceFile);
+
+		if (isEqualityOperator(operatorKind)) {
+			const left = getAttributeBinding(current.left, sourceFile, attributeAliases);
+			const right = getAttributeBinding(current.right, sourceFile, attributeAliases);
+			const leftLiteral = getLiteralValue(current.left);
+			const rightLiteral = getLiteralValue(current.right);
+
+			if (left && rightLiteral !== undefined) {
+				matches.push({
+					rule: left.rule,
+					attributeText: left.text,
+					literalText: rightLiteral,
+					node: current,
+					comparisonType: 'equality',
+					operatorText,
+				});
+			}
+
+			if (right && leftLiteral !== undefined) {
+				matches.push({
+					rule: right.rule,
+					attributeText: right.text,
+					literalText: leftLiteral,
+					node: current,
+					comparisonType: 'equality',
+					operatorText,
+				});
+			}
+		} else if (isRangeComparisonOperator(operatorKind)) {
+			const left = getAttributeBinding(current.left, sourceFile, attributeAliases);
+			const right = getAttributeBinding(current.right, sourceFile, attributeAliases);
+			const leftNumeric = getNumericLiteralText(current.left);
+			const rightNumeric = getNumericLiteralText(current.right);
+
+			if (left && rightNumeric !== undefined && left.rule.supportsRangeComparisons) {
+				matches.push({
+					rule: left.rule,
+					attributeText: left.text,
+					literalText: rightNumeric,
+					node: current,
+					comparisonType: 'range',
+					operatorText,
+				});
+			}
+
+			if (right && leftNumeric !== undefined && right.rule.supportsRangeComparisons) {
+				matches.push({
+					rule: right.rule,
+					attributeText: right.text,
+					literalText: leftNumeric,
+					node: current,
+					comparisonType: 'range',
+					operatorText,
+				});
+			}
+		}
+
+		ts.forEachChild(current, visit);
+	};
+
+	visit(expression);
+	return matches;
+}
+
 function findTermOccurrences(value: string): TermOccurrence[] {
 	const lowerValue = value.toLowerCase();
 	const occurrences: TermOccurrence[] = [];
@@ -253,6 +479,217 @@ function findWholeWordOccurrences(value: string): TermOccurrence[] {
 	}
 
 	return occurrences;
+}
+
+function collectAttributeAliases(sourceFile: ts.SourceFile): AttributeAliasMap {
+	const aliases: AttributeAliasMap = new Map();
+
+	const registerAlias = (identifier: ts.Identifier, binding: AttributeBinding) => {
+		if (!aliases.has(identifier.text)) {
+			aliases.set(identifier.text, binding);
+		}
+	};
+
+	const handleBindingPattern = (pattern: ts.ObjectBindingPattern) => {
+		for (const element of pattern.elements) {
+			if (!ts.isIdentifier(element.name)) {
+				continue;
+			}
+
+			const propertyNode = element.propertyName ?? element.name;
+			const propertyText = getBindingPropertyText(propertyNode);
+			if (!propertyText) {
+				continue;
+			}
+
+			const rule = protectedAttributeLookup.get(normalizeAttributeKey(propertyText));
+			if (rule) {
+				registerAlias(element.name, { rule, text: propertyText });
+			}
+		}
+	};
+
+	const visit = (node: ts.Node) => {
+		if (ts.isVariableDeclaration(node) && node.initializer) {
+			if (ts.isIdentifier(node.name)) {
+				const binding = resolveDirectAttributeBinding(node.initializer, sourceFile);
+				if (binding) {
+					registerAlias(node.name, binding);
+				}
+			} else if (ts.isObjectBindingPattern(node.name)) {
+				handleBindingPattern(node.name);
+			}
+		}
+
+		if (ts.isParameter(node) && ts.isObjectBindingPattern(node.name)) {
+			handleBindingPattern(node.name);
+		}
+
+		ts.forEachChild(node, visit);
+	};
+
+	visit(sourceFile);
+	return aliases;
+}
+
+function getBindingPropertyText(property: ts.PropertyName): string | undefined {
+	if (ts.isIdentifier(property) || ts.isStringLiteralLike(property) || ts.isNumericLiteral(property)) {
+		return property.text;
+	}
+
+	if (ts.isComputedPropertyName(property) && ts.isStringLiteralLike(property.expression)) {
+		return property.expression.text;
+	}
+
+	return undefined;
+}
+
+function getAttributeBinding(
+	expression: ts.Expression,
+	sourceFile: ts.SourceFile,
+	attributeAliases: AttributeAliasMap,
+): AttributeBinding | undefined {
+	if (ts.isIdentifier(expression)) {
+		const alias = attributeAliases.get(expression.text);
+		if (alias) {
+			return alias;
+		}
+	}
+
+	return resolveDirectAttributeBinding(expression, sourceFile);
+}
+
+function resolveDirectAttributeBinding(expression: ts.Expression, sourceFile: ts.SourceFile): AttributeBinding | undefined {
+	if (ts.isPropertyAccessExpression(expression)) {
+		const rule = protectedAttributeLookup.get(normalizeAttributeKey(expression.name.text));
+		if (rule) {
+			return { rule, text: expression.getText(sourceFile) };
+		}
+		return undefined;
+	}
+
+	if (ts.isElementAccessExpression(expression)) {
+		const argument = expression.argumentExpression;
+		if (argument && ts.isStringLiteralLike(argument)) {
+			const rule = protectedAttributeLookup.get(normalizeAttributeKey(argument.text));
+			if (rule) {
+				return { rule, text: expression.getText(sourceFile) };
+			}
+		}
+		return undefined;
+	}
+
+	if (ts.isIdentifier(expression)) {
+		const rule = protectedAttributeLookup.get(normalizeAttributeKey(expression.text));
+		if (rule) {
+			return { rule, text: expression.getText(sourceFile) };
+		}
+	}
+
+	return undefined;
+}
+
+function getLiteralValue(expression: ts.Expression): string | undefined {
+	if (ts.isStringLiteralLike(expression)) {
+		return expression.text;
+	}
+
+	if (ts.isNumericLiteral(expression)) {
+		return expression.text;
+	}
+
+	switch (expression.kind) {
+		case ts.SyntaxKind.TrueKeyword:
+			return 'true';
+		case ts.SyntaxKind.FalseKeyword:
+			return 'false';
+	}
+
+	return undefined;
+}
+
+function getNumericLiteralText(expression: ts.Expression): string | undefined {
+	if (ts.isNumericLiteral(expression)) {
+		return expression.text;
+	}
+
+	if (
+		ts.isPrefixUnaryExpression(expression) &&
+		expression.operator === ts.SyntaxKind.MinusToken &&
+		ts.isNumericLiteral(expression.operand)
+	) {
+		return `-${expression.operand.text}`;
+	}
+
+	return undefined;
+}
+
+function isEqualityOperator(kind: ts.SyntaxKind): boolean {
+	switch (kind) {
+		case ts.SyntaxKind.EqualsEqualsToken:
+		case ts.SyntaxKind.EqualsEqualsEqualsToken:
+		case ts.SyntaxKind.ExclamationEqualsToken:
+		case ts.SyntaxKind.ExclamationEqualsEqualsToken:
+			return true;
+		default:
+			return false;
+	}
+}
+
+function isRangeComparisonOperator(kind: ts.SyntaxKind): boolean {
+	switch (kind) {
+		case ts.SyntaxKind.GreaterThanEqualsToken:
+		case ts.SyntaxKind.GreaterThanToken:
+		case ts.SyntaxKind.LessThanEqualsToken:
+		case ts.SyntaxKind.LessThanToken:
+			return true;
+		default:
+			return false;
+	}
+}
+
+function createStructuralDiagnostic(range: vscode.Range, match: StructuralMatch): vscode.Diagnostic {
+	const severity = toDiagnosticSeverity(match.rule.severity);
+	const literalIsNumeric = match.literalText !== undefined && !Number.isNaN(Number(match.literalText));
+	const literalDescription = match.literalText
+		? literalIsNumeric
+			? match.literalText
+			: `"${match.literalText}"`
+		: 'a hardcoded value';
+
+	let comparisonLead: string;
+	switch (match.comparisonType) {
+		case 'case':
+			comparisonLead = `This switch case routes on ${match.rule.attribute} (${match.attributeText}) when it matches ${literalDescription}`;
+			break;
+		case 'range':
+			comparisonLead = `This branch gates on ${match.rule.attribute} (${match.attributeText}) via ${match.operatorText ?? 'a comparator'} ${literalDescription}`;
+			break;
+		case 'equality':
+		default:
+			comparisonLead = `This branch uses ${match.operatorText ?? '=='} to compare ${match.rule.attribute} (${match.attributeText}) to ${literalDescription}`;
+			break;
+	}
+
+	const messageParts = [
+		`${comparisonLead}, which can encode bias against protected attributes.`,
+	];
+
+	const formattedSuggestions = formatSuggestions(match.rule.suggestions ?? []);
+	if (formattedSuggestions) {
+		messageParts.push(`Consider ${formattedSuggestions}.`);
+	}
+
+	messageParts.push(`Why: ${match.rule.reason}`);
+
+	const diagnostic = new vscode.Diagnostic(range, messageParts.join(' '), severity);
+	diagnostic.code = match.rule.id;
+	diagnostic.source = 'bias-linter';
+	return diagnostic;
+}
+
+function normalizeAttributeKey(value: string): string {
+	return value.replace(/_/g, '').toLowerCase();
 }
 
 function createDiagnostic(range: vscode.Range, match: TermOccurrence): vscode.Diagnostic {

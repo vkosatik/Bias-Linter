@@ -55,6 +55,101 @@ suite('Bias Linter Terminology Diagnostics', () => {
 			assert.ok(diagnostics.some((diag) => diag.code === 'terminology.sanity_check'));
 		});
 	});
+
+	test('flags hardcoded gender branch logic', async () => {
+		const source = [
+			'function allocate(user) {',
+			"\tif (user.gender === 'female') {",
+			"\t\treturn 'pink';",
+			'\t}',
+			"\treturn 'blue';",
+			'}',
+		].join('\n');
+
+		await withDocument(source, 'typescript', async (document) => {
+			const diagnostics = await waitForDiagnostics(document.uri, (entries) =>
+				entries.some((diag) => diag.code === 'logic.gender_branch'),
+			);
+			assert.ok(
+				diagnostics.some((diag) => diag.code === 'logic.gender_branch'),
+				'Expected a structural diagnostic for gender-based branching.',
+			);
+		});
+	});
+
+	test('ignores neutral control flow', async () => {
+		const source = [
+			'function gate(user) {',
+			"\tif (user.role === 'admin') {",
+			"\t\treturn 'all';",
+			'\t}',
+			"\treturn 'limited';",
+			'}',
+		].join('\n');
+
+		await withDocument(source, 'typescript', async (document) => {
+			await delay(200);
+			const diagnostics = vscode.languages.getDiagnostics(document.uri);
+			assert.strictEqual(
+				diagnostics.length,
+				0,
+				'Expected no diagnostics for non-protected branching logic.',
+			);
+		});
+	});
+
+	test('flags destructured attribute aliases', async () => {
+		const source = [
+			'function personalize({ gender }) {',
+			"\treturn gender !== 'non-binary' ? 'legacy-flow' : 'beta-flow';",
+			'}',
+		].join('\n');
+
+		await withDocument(source, 'typescript', async (document) => {
+			const diagnostics = await waitForDiagnostics(document.uri, (entries) =>
+				entries.some((diag) => diag.code === 'logic.gender_branch'),
+			);
+			assert.ok(diagnostics.some((diag) => diag.code === 'logic.gender_branch'));
+		});
+	});
+
+	test('flags age-based range comparisons', async () => {
+		const source = [
+			'function eligibility(user) {',
+			"\tif (user.age >= 65) {",
+			"\t\treturn 'vip';",
+			'\t}',
+			"\treturn 'standard';",
+			'}',
+		].join('\n');
+
+		await withDocument(source, 'typescript', async (document) => {
+			const diagnostics = await waitForDiagnostics(document.uri, (entries) =>
+				entries.some((diag) => diag.code === 'logic.age_branch'),
+			);
+			assert.ok(
+				diagnostics.some((diag) => diag.code === 'logic.age_branch'),
+				'Expected a structural diagnostic for age gating.',
+			);
+		});
+	});
+
+	test('ignores numeric comparisons on non-protected data', async () => {
+		const source = [
+			'function budget(user) {',
+			"\tif (user.score > 900) {",
+			"\t\treturn 'vip';",
+			'\t}',
+			"\treturn 'standard';",
+			'}',
+		].join('\n');
+
+		await withDocument(source, 'typescript', async (document) => {
+			await delay(200);
+			const diagnostics = vscode.languages.getDiagnostics(document.uri);
+			assert.strictEqual(diagnostics.length, 0, 'Expected no diagnostics for neutral numeric gate.');
+		});
+	});
 });
 
 async function withDocument(
