@@ -42,9 +42,9 @@ interface StructuralMatch {
 	rule: ProtectedAttributeRule;
 	attributeText: string;
 	literalText?: string;
-	comparisonType: 'equality' | 'range' | 'case';
+	comparisonType: 'equality' | 'range' | 'case' | 'membership';
 	operatorText?: string;
-	node: ts.Node;
+	node?: ts.Node;
 }
 
 type AttributeBinding = { rule: ProtectedAttributeRule; text: string };
@@ -239,6 +239,10 @@ function lintWithText(document: vscode.TextDocument, sourceText: string): vscode
 		diagnostics.push(createDiagnostic(range, occurrence));
 	}
 
+	if (document.languageId === 'python') {
+		diagnostics.push(...lintPythonStructural(document, sourceText));
+	}
+
 	return diagnostics;
 }
 
@@ -305,6 +309,9 @@ function collectStructuralLogicDiagnostics(
 	if (ts.isIfStatement(node)) {
 		const matches = findProtectedAttributeComparisons(node.expression, sourceFile, attributeAliases);
 		for (const match of matches) {
+			if (!match.node) {
+				continue;
+			}
 			const range = new vscode.Range(
 				document.positionAt(match.node.getStart(sourceFile)),
 				document.positionAt(match.node.getEnd()),
@@ -317,6 +324,9 @@ function collectStructuralLogicDiagnostics(
 	if (ts.isConditionalExpression(node)) {
 		const matches = findProtectedAttributeComparisons(node.condition, sourceFile, attributeAliases);
 		for (const match of matches) {
+			if (!match.node) {
+				continue;
+			}
 			const range = new vscode.Range(
 				document.positionAt(match.node.getStart(sourceFile)),
 				document.positionAt(match.node.getEnd()),
@@ -479,6 +489,448 @@ function findWholeWordOccurrences(value: string): TermOccurrence[] {
 	}
 
 	return occurrences;
+}
+
+function lintPythonStructural(document: vscode.TextDocument, sourceText: string): vscode.Diagnostic[] {
+	const diagnostics: vscode.Diagnostic[] = [];
+	const aliasMap = collectPythonAttributeAliases(sourceText);
+	const statementPattern = /\b(if|elif|while)\s+([^:\n]+)\s*:/g;
+	const seen = new Set<string>();
+	let statementMatch: RegExpExecArray | null;
+
+	while ((statementMatch = statementPattern.exec(sourceText)) !== null) {
+		const fullMatch = statementMatch[0];
+		const conditionText = statementMatch[2];
+		if (!conditionText) {
+			continue;
+		}
+
+		const conditionIndexInMatch = fullMatch.indexOf(conditionText);
+		if (conditionIndexInMatch === -1) {
+			continue;
+		}
+
+		const conditionStartInDoc = statementMatch.index + conditionIndexInMatch;
+		const comparisonPattern = /([^&|]+?)\s*(==|!=|<=|>=|<|>)\s*([^&|]+?)(?=\s*(?:and|or|$))/g;
+		let comparisonMatch: RegExpExecArray | null;
+
+		while ((comparisonMatch = comparisonPattern.exec(conditionText)) !== null) {
+			const rawLeft = comparisonMatch[1] ?? '';
+			const operatorText = comparisonMatch[2];
+			const rawRight = comparisonMatch[3] ?? '';
+			const rawComparison = comparisonMatch[0];
+			const trimmedComparison = rawComparison.trim();
+			const leadingWhitespace = rawComparison.length - rawComparison.trimStart().length;
+			const comparisonOffset = conditionStartInDoc + comparisonMatch.index + leadingWhitespace;
+			const comparisonLength = trimmedComparison.length;
+			const rangeStart = document.positionAt(comparisonOffset);
+			const rangeEnd = document.positionAt(comparisonOffset + comparisonLength);
+			const range = new vscode.Range(rangeStart, rangeEnd);
+
+			const leftText = stripEnclosingParens(rawLeft.trim());
+			const rightText = stripEnclosingParens(rawRight.trim());
+			const leftBinding = resolvePythonAttributeBinding(leftText, aliasMap);
+			const rightBinding = resolvePythonAttributeBinding(rightText, aliasMap);
+			const leftLiteral = parsePythonLiteral(leftText);
+			const rightLiteral = parsePythonLiteral(rightText);
+			const comparisonType = isRangeOperatorText(operatorText) ? 'range' : 'equality';
+
+			if (leftBinding && rightLiteral !== undefined) {
+				if (comparisonType === 'range' && !leftBinding.rule.supportsRangeComparisons) {
+					// Skip range comparisons for rules that do not support them.
+				} else {
+					const key = `${leftBinding.rule.id}:${comparisonOffset}:${rightLiteral}:${operatorText}`;
+					if (!seen.has(key)) {
+						seen.add(key);
+						diagnostics.push(
+							createStructuralDiagnostic(range, {
+								rule: leftBinding.rule,
+								attributeText: leftBinding.text,
+								literalText: rightLiteral,
+								comparisonType,
+								operatorText,
+							}),
+						);
+					}
+				}
+			}
+
+			if (rightBinding && leftLiteral !== undefined) {
+				if (comparisonType === 'range' && !rightBinding.rule.supportsRangeComparisons) {
+					continue;
+				}
+				const key = `${rightBinding.rule.id}:${comparisonOffset}:${leftLiteral}:${operatorText}`;
+				if (!seen.has(key)) {
+					seen.add(key);
+					diagnostics.push(
+						createStructuralDiagnostic(range, {
+							rule: rightBinding.rule,
+							attributeText: rightBinding.text,
+							literalText: leftLiteral,
+							comparisonType,
+							operatorText,
+						}),
+					);
+				}
+			}
+		}
+
+		const membershipPattern = /([^&|]+?)\s+(not\s+in|in)\s+([^&|]+?)(?=\s*(?:and|or|$))/g;
+		let membershipMatch: RegExpExecArray | null;
+		while ((membershipMatch = membershipPattern.exec(conditionText)) !== null) {
+			const rawLeft = membershipMatch[1] ?? '';
+			const operatorText = membershipMatch[2];
+			const rawRight = membershipMatch[3] ?? '';
+			const rawComparison = membershipMatch[0];
+			const trimmedComparison = rawComparison.trim();
+			const leadingWhitespace = rawComparison.length - rawComparison.trimStart().length;
+			const comparisonOffset = conditionStartInDoc + membershipMatch.index + leadingWhitespace;
+			const comparisonLength = trimmedComparison.length;
+			const rangeStart = document.positionAt(comparisonOffset);
+			const rangeEnd = document.positionAt(comparisonOffset + comparisonLength);
+			const range = new vscode.Range(rangeStart, rangeEnd);
+
+			const normalizedOperator = operatorText.replace(/\s+/g, ' ');
+			const leftText = stripEnclosingParens(rawLeft.trim());
+			const rightText = stripEnclosingParens(rawRight.trim());
+			const leftBinding = resolvePythonAttributeBinding(leftText, aliasMap);
+			const rightBinding = resolvePythonAttributeBinding(rightText, aliasMap);
+			const leftLiteral = parsePythonLiteral(leftText);
+			const rightLiteral = parsePythonLiteral(rightText);
+			const leftCollection = summarizePythonCollectionLiteral(leftText);
+			const rightCollection = summarizePythonCollectionLiteral(rightText);
+
+			if (leftBinding && (rightLiteral !== undefined || rightCollection)) {
+				const literalValue = rightCollection ?? rightLiteral ?? rightText;
+				const key = `${leftBinding.rule.id}:membership:${comparisonOffset}:${literalValue}:${normalizedOperator}`;
+				if (!seen.has(key)) {
+					seen.add(key);
+					diagnostics.push(
+						createStructuralDiagnostic(range, {
+							rule: leftBinding.rule,
+							attributeText: leftBinding.text,
+							literalText: literalValue,
+							comparisonType: 'membership',
+							operatorText: normalizedOperator,
+						}),
+					);
+				}
+			}
+
+			if (rightBinding && (leftLiteral !== undefined || leftCollection)) {
+				const literalValue = leftCollection ?? leftLiteral ?? leftText;
+				const key = `${rightBinding.rule.id}:membership:${comparisonOffset}:${literalValue}:${normalizedOperator}`;
+				if (!seen.has(key)) {
+					seen.add(key);
+					diagnostics.push(
+						createStructuralDiagnostic(range, {
+							rule: rightBinding.rule,
+							attributeText: rightBinding.text,
+							literalText: literalValue,
+							comparisonType: 'membership',
+							operatorText: normalizedOperator,
+						}),
+					);
+				}
+			}
+		}
+	}
+
+	diagnostics.push(...lintPythonMatchStatements(document, sourceText, aliasMap));
+
+	return diagnostics;
+}
+
+function lintPythonMatchStatements(
+	document: vscode.TextDocument,
+	sourceText: string,
+	aliasMap: AttributeAliasMap,
+): vscode.Diagnostic[] {
+	const diagnostics: vscode.Diagnostic[] = [];
+	const lines = sourceText.split(/\r?\n/);
+	const seen = new Set<string>();
+
+	for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+		const line = lines[lineIndex];
+		const trimmed = line.trim();
+		if (!trimmed.startsWith('match ')) {
+			continue;
+		}
+
+		const indentMatch = line.match(/^\s*/);
+		const indent = indentMatch ? indentMatch[0] : '';
+		const expressionText = trimmed.slice('match '.length).replace(/:$/, '').trim();
+		if (expressionText.length === 0) {
+			continue;
+		}
+
+		const attributeBinding = resolvePythonAttributeBinding(expressionText, aliasMap);
+		if (!attributeBinding) {
+			continue;
+		}
+
+		for (let lookahead = lineIndex + 1; lookahead < lines.length; lookahead += 1) {
+			const candidateLine = lines[lookahead];
+			const candidateTrimmed = candidateLine.trim();
+			const candidateIndentMatch = candidateLine.match(/^\s*/);
+			const candidateIndent = candidateIndentMatch ? candidateIndentMatch[0] : '';
+
+			if (candidateTrimmed.length === 0) {
+				continue;
+			}
+
+			if (candidateIndent.length <= indent.length && !candidateTrimmed.startsWith('case ')) {
+				break;
+			}
+
+			if (!candidateTrimmed.startsWith('case ')) {
+				continue;
+			}
+
+			const caseBody = candidateTrimmed.slice('case '.length);
+			const colonIndex = caseBody.indexOf(':');
+			let rawPattern = colonIndex === -1 ? caseBody : caseBody.slice(0, colonIndex);
+			rawPattern = rawPattern.trim();
+			if (rawPattern.length === 0 || rawPattern === '_') {
+				continue;
+			}
+
+			const guardIndex = rawPattern.indexOf(' if ');
+			if (guardIndex !== -1) {
+				rawPattern = rawPattern.slice(0, guardIndex).trim();
+			}
+
+			const literal = parsePythonLiteral(rawPattern);
+			if (literal === undefined) {
+				continue;
+			}
+
+			const caseColumn = candidateLine.indexOf('case ');
+			const patternLeadingWhitespace = caseBody.length - caseBody.trimStart().length;
+			const patternColumn = caseColumn + 'case '.length + patternLeadingWhitespace;
+			const patternLength = rawPattern.length;
+			const rangeStart = new vscode.Position(lookahead, patternColumn);
+			const rangeEnd = new vscode.Position(lookahead, patternColumn + patternLength);
+			const range = new vscode.Range(rangeStart, rangeEnd);
+
+			const key = `${attributeBinding.rule.id}:match:${lookahead}:${patternColumn}:${literal}`;
+			if (seen.has(key)) {
+				continue;
+			}
+			seen.add(key);
+
+			diagnostics.push(
+				createStructuralDiagnostic(range, {
+					rule: attributeBinding.rule,
+					attributeText: attributeBinding.text,
+					literalText: literal,
+					comparisonType: 'case',
+					operatorText: 'match',
+				}),
+			);
+		}
+	}
+
+	return diagnostics;
+}
+
+function collectPythonAttributeAliases(sourceText: string): AttributeAliasMap {
+	const aliases: AttributeAliasMap = new Map();
+	const assignmentPattern = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$/gm;
+	let match: RegExpExecArray | null;
+
+	while ((match = assignmentPattern.exec(sourceText)) !== null) {
+		const identifier = match[1];
+		const expression = stripInlineComment(match[2]);
+		const binding = resolveDirectPythonAttributeBinding(expression);
+		if (binding) {
+			aliases.set(identifier, binding);
+		}
+	}
+
+	return aliases;
+}
+
+function stripInlineComment(value: string): string {
+	const hashIndex = value.indexOf('#');
+	if (hashIndex === -1) {
+		return value.trim();
+	}
+	return value.slice(0, hashIndex).trimEnd();
+}
+
+function stripEnclosingParens(value: string): string {
+	let result = value.trim();
+	while (result.startsWith('(') && result.endsWith(')')) {
+		const inner = result.slice(1, -1);
+		if (!hasBalancedParentheses(inner)) {
+			break;
+		}
+		result = inner.trim();
+	}
+	while (result.endsWith(')') && !hasBalancedParentheses(result)) {
+		result = result.slice(0, -1).trimEnd();
+	}
+	return result;
+}
+
+function hasBalancedParentheses(value: string): boolean {
+	let depth = 0;
+	for (const char of value) {
+		if (char === '(') {
+			depth += 1;
+		} else if (char === ')') {
+			if (depth === 0) {
+				return false;
+			}
+			depth -= 1;
+		}
+	}
+	return depth === 0;
+}
+
+function resolvePythonAttributeBinding(
+	expressionText: string,
+	aliases?: AttributeAliasMap,
+): AttributeBinding | undefined {
+	const trimmed = expressionText.trim();
+	if (trimmed.length === 0) {
+		return undefined;
+	}
+
+	if (aliases) {
+		const directAlias = aliases.get(trimmed);
+		if (directAlias) {
+			return directAlias;
+		}
+
+		const simpleIdentifierMatch = trimmed.match(/^[A-Za-z_][A-Za-z0-9_]*$/);
+		if (simpleIdentifierMatch) {
+			const alias = aliases.get(simpleIdentifierMatch[0]);
+			if (alias) {
+				return alias;
+			}
+		}
+	}
+
+	return resolveDirectPythonAttributeBinding(trimmed);
+}
+
+function resolveDirectPythonAttributeBinding(expressionText: string): AttributeBinding | undefined {
+	const trimmed = expressionText.trim();
+	if (trimmed.length === 0 || isPythonLiteral(trimmed)) {
+		return undefined;
+	}
+
+	const identifierPattern = /[A-Za-z_][A-Za-z0-9_]*/g;
+	const visited = new Set<string>();
+	let match: RegExpExecArray | null;
+
+	while ((match = identifierPattern.exec(trimmed)) !== null) {
+		const token = match[0];
+		if (visited.has(token)) {
+			continue;
+		}
+		visited.add(token);
+
+		const rule = matchPythonTokenToRule(token);
+		if (rule) {
+			return { rule, text: trimmed };
+		}
+	}
+
+	return undefined;
+}
+
+function matchPythonTokenToRule(token: string): ProtectedAttributeRule | undefined {
+	const direct = protectedAttributeLookup.get(normalizeAttributeKey(token));
+	if (direct) {
+		return direct;
+	}
+
+	const pieces = token.split(/_|(?=[A-Z])/g).filter((piece) => piece.length > 0);
+	for (const piece of pieces) {
+		const rule = protectedAttributeLookup.get(normalizeAttributeKey(piece));
+		if (rule) {
+			return rule;
+		}
+	}
+
+	return undefined;
+}
+
+function parsePythonLiteral(expressionText: string): string | undefined {
+	const trimmed = expressionText.trim();
+	if (trimmed.length === 0) {
+		return undefined;
+	}
+
+	if (
+		(trimmed.startsWith("'") && trimmed.endsWith("'")) ||
+		(trimmed.startsWith('"') && trimmed.endsWith('"'))
+	) {
+		if (trimmed.length >= 2) {
+			return trimmed.slice(1, -1);
+		}
+		return '';
+	}
+
+	if (/^[-+]?\d+(?:\.\d+)?$/.test(trimmed)) {
+		return trimmed;
+	}
+
+	if (trimmed === 'True' || trimmed === 'False' || trimmed === 'None') {
+		return trimmed;
+	}
+
+	return undefined;
+}
+
+function isPythonLiteral(expressionText: string): boolean {
+	return parsePythonLiteral(expressionText) !== undefined;
+}
+
+function summarizePythonCollectionLiteral(expressionText: string): string | undefined {
+	const trimmed = expressionText.trim();
+	if (trimmed.length === 0) {
+		return undefined;
+	}
+
+	if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(trimmed)) {
+		return trimmed;
+	}
+
+	const wrapperMatch = trimmed.match(/^(set|list|tuple|frozenset)\((.*)\)$/i);
+	const inner = wrapperMatch ? wrapperMatch[2] : trimmed;
+	const strings = Array.from(inner.matchAll(/(['"])(.*?)\1/g)).map((match) => match[2]).filter((value) => value.length > 0);
+	if (strings.length > 0) {
+		const preview = strings.slice(0, 3).join(', ');
+		return strings.length > 3 ? `${preview}, ...` : preview;
+	}
+
+	const numbers = inner.match(/[-+]?\d+(?:\.\d+)?/g) ?? [];
+	if (numbers.length > 0) {
+		const preview = numbers.slice(0, 3).join(', ');
+		return numbers.length > 3 ? `${preview}, ...` : preview;
+	}
+
+	if (/^[\[\{\(].*[\]\}\)]$/.test(trimmed)) {
+		return trimmed.length <= 40 ? trimmed : `${trimmed.slice(0, 37)}...`;
+	}
+
+	return undefined;
+}
+
+function isRangeOperatorText(operator: string): boolean {
+	switch (operator) {
+		case '>=':
+		case '>':
+		case '<=':
+		case '<':
+			return true;
+		default:
+			return false;
+	}
 }
 
 function collectAttributeAliases(sourceFile: ts.SourceFile): AttributeAliasMap {
@@ -665,6 +1117,16 @@ function createStructuralDiagnostic(range: vscode.Range, match: StructuralMatch)
 		case 'range':
 			comparisonLead = `This branch gates on ${match.rule.attribute} (${match.attributeText}) via ${match.operatorText ?? 'a comparator'} ${literalDescription}`;
 			break;
+		case 'membership': {
+			const membershipTarget = match.literalText
+				? match.literalText.includes(',')
+					? `[${match.literalText}]`
+					: match.literalText
+				: 'the provided collection';
+			const operatorDisplay = match.operatorText ?? 'in';
+			comparisonLead = `This branch checks whether ${match.rule.attribute} (${match.attributeText}) is ${operatorDisplay} ${membershipTarget}`;
+			break;
+		}
 		case 'equality':
 		default:
 			comparisonLead = `This branch uses ${match.operatorText ?? '=='} to compare ${match.rule.attribute} (${match.attributeText}) to ${literalDescription}`;
