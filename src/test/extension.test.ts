@@ -56,6 +56,63 @@ suite('Bias Linter Terminology Diagnostics', () => {
 		});
 	});
 
+	test('flags biased dataset import in python', async () => {
+		const pythonSource = [
+			'from sklearn.datasets import load_boston',
+			'',
+			'def build_model():',
+			'	return load_boston()',
+		].join('\n');
+
+		await withDocument(pythonSource, 'python', async (document) => {
+			const diagnostics = await waitForDiagnostics(document.uri, (entries) =>
+				entries.some((diag) => diag.code === 'supplychain.sklearn.load_boston'),
+			);
+			assert.ok(
+				diagnostics.some((diag) => diag.code === 'supplychain.sklearn.load_boston'),
+				'Expected a supply-chain diagnostic for load_boston import.',
+			);
+		});
+	});
+
+	test('flags biased dataset call from aliased import', async () => {
+		const pythonSource = [
+			'import sklearn.datasets as datasets',
+			'',
+			'def fetch_data():',
+			'	return datasets.load_boston()',
+		].join('\n');
+
+		await withDocument(pythonSource, 'python', async (document) => {
+			const diagnostics = await waitForDiagnostics(document.uri, (entries) =>
+				entries.some((diag) => diag.code === 'supplychain.sklearn.load_boston'),
+			);
+			assert.ok(
+				diagnostics.some((diag) => diag.code === 'supplychain.sklearn.load_boston'),
+				'Expected a supply-chain diagnostic for load_boston call access.',
+			);
+		});
+	});
+
+	test('ignores neutral dataset import in python', async () => {
+		const pythonSource = [
+			'from sklearn.datasets import load_iris',
+			'',
+			'def build_model():',
+			'	return load_iris()',
+		].join('\n');
+
+		await withDocument(pythonSource, 'python', async (document) => {
+			await delay(200);
+			const diagnostics = vscode.languages.getDiagnostics(document.uri);
+			assert.strictEqual(
+				diagnostics.length,
+				0,
+				'Expected no supply-chain diagnostics for neutral dataset import.',
+			);
+		});
+	});
+
 	test('flags hardcoded gender branch logic', async () => {
 		const source = [
 			'function allocate(user) {',

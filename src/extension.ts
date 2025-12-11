@@ -1,8 +1,7 @@
-// The module 'vscode' contains the VS Code extensibility API
-// Import the module and reference it with the alias vscode in your code below
 import * as vscode from 'vscode';
 import * as ts from 'typescript';
 import terminologyData from './data/terms.json';
+import datasetData from './data/datasets.json';
 
 type BiasSeverity = 'hint' | 'information' | 'warning' | 'error';
 
@@ -47,6 +46,16 @@ interface StructuralMatch {
 	node?: ts.Node;
 }
 
+interface DatasetRule {
+	id: string;
+	language: string;
+	module?: string;
+	symbols?: string[];
+	reason: string;
+	suggestions?: string[];
+	severity?: BiasSeverity;
+}
+
 type AttributeBinding = { rule: ProtectedAttributeRule; text: string };
 type AttributeAliasMap = Map<string, AttributeBinding>;
 
@@ -76,6 +85,18 @@ const normalizedTerms: NormalizedTerm[] = biasTerms.flatMap((entry) => {
 		variant: variant.toLowerCase(),
 	}));
 });
+
+const datasetRules: DatasetRule[] = datasetData as DatasetRule[];
+const datasetRulesByLanguage = new Map<string, DatasetRule[]>();
+for (const rule of datasetRules) {
+	const key = rule.language.toLowerCase();
+	const bucket = datasetRulesByLanguage.get(key);
+	if (bucket) {
+		bucket.push(rule);
+	} else {
+		datasetRulesByLanguage.set(key, [rule]);
+	}
+}
 
 const PROTECTED_ATTRIBUTE_RULES: ProtectedAttributeRule[] = [
 	{
@@ -241,6 +262,7 @@ function lintWithText(document: vscode.TextDocument, sourceText: string): vscode
 
 	if (document.languageId === 'python') {
 		diagnostics.push(...lintPythonStructural(document, sourceText));
+		diagnostics.push(...lintPythonSupplyChain(document, sourceText));
 	}
 
 	return diagnostics;
@@ -637,6 +659,148 @@ function lintPythonStructural(document: vscode.TextDocument, sourceText: string)
 	}
 
 	diagnostics.push(...lintPythonMatchStatements(document, sourceText, aliasMap));
+
+	return diagnostics;
+}
+
+function lintPythonSupplyChain(document: vscode.TextDocument, sourceText: string): vscode.Diagnostic[] {
+	const rules = datasetRulesByLanguage.get('python');
+	if (!rules || rules.length === 0) {
+		return [];
+	}
+
+	const diagnostics: vscode.Diagnostic[] = [];
+	const lines = sourceText.split(/\r?\n/);
+	const seen = new Set<string>();
+
+	for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+		const line = lines[lineIndex];
+		const trimmed = line.trim();
+		if (trimmed.startsWith('#') || trimmed.length === 0) {
+			continue;
+		}
+
+		const fromMatch = line.match(/^(\s*)from\s+([A-Za-z0-9_.]+)\s+import\s+(.+)$/);
+		if (fromMatch) {
+			const [, leadingWhitespace, moduleName, importedSection] = fromMatch;
+			const relevantRules = rules.filter((rule) => rule.module === moduleName);
+			if (relevantRules.length === 0) {
+				continue;
+			}
+
+			const parts = importedSection.split(',');
+			let searchCursor = 0;
+			for (const part of parts) {
+				const rawPart = part.trim();
+				if (rawPart.length === 0) {
+					continue;
+				}
+
+				const [symbolName] = rawPart.split(/\s+as\s+/);
+				const matchingRule = relevantRules.find((rule) => (rule.symbols ?? []).includes(symbolName));
+				if (!matchingRule) {
+					searchCursor += part.length + 1;
+					continue;
+				}
+
+				const partIndex = line.indexOf(rawPart, searchCursor);
+				const startColumn = partIndex === -1 ? leadingWhitespace.length + `from ${moduleName} import `.length : partIndex;
+				const endColumn = startColumn + rawPart.length;
+				const range = new vscode.Range(new vscode.Position(lineIndex, startColumn), new vscode.Position(lineIndex, endColumn));
+				const key = `${matchingRule.id}:from:${lineIndex}:${startColumn}`;
+				if (seen.has(key)) {
+					searchCursor += part.length + 1;
+					continue;
+				}
+				seen.add(key);
+
+				diagnostics.push(
+					createDatasetDiagnostic(range, matchingRule, {
+						moduleName,
+						symbolName,
+						matchedText: rawPart,
+						sourceType: 'import',
+					}),
+				);
+				searchCursor += part.length + 1;
+			}
+
+			continue;
+		}
+
+		const importMatch = line.match(/^(\s*)import\s+(.+)$/);
+		if (importMatch) {
+			const [, leadingWhitespace, importedSection] = importMatch;
+			const parts = importedSection.split(',');
+			let searchCursor = 0;
+			for (const part of parts) {
+				const rawPart = part.trim();
+				if (rawPart.length === 0) {
+					continue;
+				}
+
+				const [moduleName] = rawPart.split(/\s+as\s+/);
+				const matchingRule = rules.find((rule) => rule.module === moduleName && (!rule.symbols || rule.symbols.length === 0));
+				if (!matchingRule) {
+					searchCursor += part.length + 1;
+					continue;
+				}
+
+				const partIndex = line.indexOf(rawPart, searchCursor);
+				const startColumn = partIndex === -1 ? leadingWhitespace.length + 'import '.length : partIndex;
+				const endColumn = startColumn + rawPart.length;
+				const range = new vscode.Range(new vscode.Position(lineIndex, startColumn), new vscode.Position(lineIndex, endColumn));
+				const key = `${matchingRule.id}:import:${lineIndex}:${startColumn}`;
+				if (seen.has(key)) {
+					searchCursor += part.length + 1;
+					continue;
+				}
+				seen.add(key);
+
+				diagnostics.push(
+					createDatasetDiagnostic(range, matchingRule, {
+						moduleName,
+						matchedText: rawPart,
+						sourceType: 'import',
+					}),
+				);
+				searchCursor += part.length + 1;
+			}
+
+			continue;
+		}
+
+		for (const rule of rules) {
+			if (!rule.symbols || rule.symbols.length === 0) {
+				continue;
+			}
+			for (const symbolName of rule.symbols) {
+				const callPattern = new RegExp(`(?:^|[^A-Za-z0-9_])(${escapeRegExp(symbolName)})\\s*\\(`);
+				const callMatch = callPattern.exec(line);
+				if (!callMatch) {
+					continue;
+				}
+
+				const matchedText = callMatch[1];
+				const startColumn = callMatch.index + (callMatch[0].length - callMatch[1].length);
+				const endColumn = startColumn + matchedText.length;
+				const range = new vscode.Range(new vscode.Position(lineIndex, startColumn), new vscode.Position(lineIndex, endColumn));
+				const key = `${rule.id}:call:${lineIndex}:${startColumn}`;
+				if (seen.has(key)) {
+					continue;
+				}
+				seen.add(key);
+
+				diagnostics.push(
+					createDatasetDiagnostic(range, rule, {
+						symbolName,
+						matchedText,
+						sourceType: 'call',
+					}),
+				);
+			}
+		}
+	}
 
 	return diagnostics;
 }
@@ -1112,7 +1276,10 @@ function createStructuralDiagnostic(range: vscode.Range, match: StructuralMatch)
 	let comparisonLead: string;
 	switch (match.comparisonType) {
 		case 'case':
-			comparisonLead = `This switch case routes on ${match.rule.attribute} (${match.attributeText}) when it matches ${literalDescription}`;
+			{
+				const caseLabel = match.operatorText === 'match' ? 'match case' : 'switch case';
+				comparisonLead = `This ${caseLabel} routes on ${match.rule.attribute} (${match.attributeText}) when it matches ${literalDescription}`;
+			}
 			break;
 		case 'range':
 			comparisonLead = `This branch gates on ${match.rule.attribute} (${match.attributeText}) via ${match.operatorText ?? 'a comparator'} ${literalDescription}`;
@@ -1146,6 +1313,43 @@ function createStructuralDiagnostic(range: vscode.Range, match: StructuralMatch)
 
 	const diagnostic = new vscode.Diagnostic(range, messageParts.join(' '), severity);
 	diagnostic.code = match.rule.id;
+	diagnostic.source = 'bias-linter';
+	return diagnostic;
+}
+
+interface DatasetMatchContext {
+	moduleName?: string;
+	symbolName?: string;
+	matchedText: string;
+	sourceType: 'import' | 'call';
+}
+
+function createDatasetDiagnostic(
+	range: vscode.Range,
+	rule: DatasetRule,
+	context: DatasetMatchContext,
+): vscode.Diagnostic {
+	const severity = toDiagnosticSeverity(rule.severity);
+	const locationDescription = context.sourceType === 'call' ? 'call' : 'import';
+	const referenceDescription = context.symbolName
+		? `"${context.symbolName}" in ${context.moduleName ?? 'this module'}`
+		: context.moduleName
+			? `the module "${context.moduleName}"`
+			: `"${context.matchedText}"`;
+
+	const messageParts = [
+		`${locationDescription.charAt(0).toUpperCase() + locationDescription.slice(1)} ${referenceDescription} is linked to known biased data sources.`,
+	];
+
+	const formattedSuggestions = formatSuggestions(rule.suggestions ?? []);
+	if (formattedSuggestions) {
+		messageParts.push(`Consider ${formattedSuggestions}.`);
+	}
+
+	messageParts.push(`Why: ${rule.reason}`);
+
+	const diagnostic = new vscode.Diagnostic(range, messageParts.join(' '), severity);
+	diagnostic.code = rule.id;
 	diagnostic.source = 'bias-linter';
 	return diagnostic;
 }

@@ -1,0 +1,29 @@
+[
+	{
+		"id": "supplychain.sklearn.load_boston",
+		"language": "python",
+		"module": "sklearn.datasets",
+		"symbols": ["load_boston"],
+		"reason": "The Boston Housing dataset encodes discriminatory variables (race) and was deprecated by scikit-learn due to ethical concerns.",
+		"suggestions": ["Use a fair-housing compliant dataset", "Consult domain experts before modeling housing risk"],
+		"severity": "warning"
+	},
+	{
+		"id": "supplychain.nltk.twitter_samples",
+		"language": "python",
+		"module": "nltk.corpus",
+		"symbols": ["twitter_samples"],
+		"reason": "The NLTK Twitter corpus contains demographic and dialect bias that can propagate into sentiment and moderation systems under the 'noise' attribute.",
+		"suggestions": ["Sample domain-specific data with consent", "Apply debiasing or reweighting before training"],
+		"severity": "information"
+	},
+	{
+		"id": "supplychain.statsmodels.fec",
+		"language": "python",
+		"module": "statsmodels.datasets",
+		"symbols": ["anes96", "ccard", "grunfeld"],
+		"reason": "Several legacy Statsmodels datasets include outdated features that can introduce a biased trend without review.",
+		"suggestions": ["Assess collection practices for legacy datasets", "Document provenance before use"],
+		"severity": "information"
+	}
+]
